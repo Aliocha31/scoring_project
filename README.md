@@ -1,0 +1,1 @@
+Scoring Project for M2 Financial Economics Paris 1 Sorbonne : using data from 
