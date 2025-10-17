@@ -1,17 +1,10 @@
-# Extensions from the the original homework 
-import matplotlib.pyplot as plt
+# Extensions from the the original homework
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import polars as pl
-import scipy.stats as stats
-import seaborn as sns
 import statsmodels.api as sm
-import statsmodels.formula.api as smf
-import warnings
-from scipy.stats import kurtosis, skew
 from sklearn.impute import KNNImputer
-from sklearn.metrics import auc, roc_auc_score, roc_curve
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from statsmodels.discrete.discrete_model import Logit, Probit
@@ -61,21 +54,20 @@ print("Missing values before (features):", X_full.isna().sum().sum())
 print("Missing values after  (features):", X_final.isna().sum().sum())
 
 # === PART 2: Train/test split (random) ===
+VAR = ["tdta", "gempl", "opita", "invsls"]
 
 feature_cols = [c for c in df_pl.columns if c not in ("id", target_col)]
 
-core_features = [c for c in ["tdta", "ebita", "invsls"] if c in feature_cols]
+core_features = [c for c in VAR if c in feature_cols]
 if len(core_features) == 0:
-    raise ValueError(
-        "None of the core features ['tdta','ebita','invsls'] found in dataframe."
-    )
+    raise ValueError(f"None of the core features {VAR} found in dataframe.")
 
 X_all = df_pl.select(feature_cols)
 y_all = df_pl.select(["id", target_col])
 
 
 X_train_pl, X_test_pl, y_train_pl, y_test_pl = train_test_split(
-    X_all, y_all, test_size=0.30, random_state=42
+    X_all, y_all, test_size=0.25, random_state=42
 )
 
 
@@ -166,4 +158,3 @@ print(results_table)
 print("\n=== OLS ===\n", model_ols.summary())
 print("\n=== Logit ===\n", model_log.summary())
 print("\n=== Probit ===\n", model_prob.summary())
-

@@ -1,3 +1,5 @@
+import warnings
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -7,29 +9,30 @@ import scipy.stats as stats
 import seaborn as sns
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
-import warnings
 from scipy.stats import kurtosis, skew
-from sklearn.impute import KNNImputer
 from sklearn.metrics import auc, roc_auc_score, roc_curve
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from statsmodels.discrete.discrete_model import Logit, Probit
 from statsmodels.iolib.summary2 import summary_col
 
-#convert to latex : True to createnew file, False to skip this step 
-convert_to_latex = False
+# convert to latex : True to createnew file, False to skip this step
+convert_to_latex = True
 
 if convert_to_latex == False:
-    warnings.warn("Latex conversion skipped. Set convert_to_latex = True to enable it.",UserWarning)
+    warnings.warn(
+        "Latex conversion skipped. Set convert_to_latex = True to enable it.",
+        UserWarning,
+    )
 else:
-    warnings.warn("Latex conversion not skipped. Set convert_to_latex = False to stop it.",UserWarning)
+    warnings.warn(
+        "Latex conversion not skipped. Set convert_to_latex = False to stop it.",
+        UserWarning,
+    )
 
 
 df_sco = (
     pl.read_csv(
         "./defaut2000.csv", use_pyarrow=True, separator=";", null_values=["-99.99"]
-    )
-    .fill_null(np.nan)
+    ).fill_null(np.nan)
 ).drop_nans()
 
 df_sort = df_sco.sort(("yd", "reta"))
@@ -65,12 +68,12 @@ X_train_non_def = df_dum.filter((pl.col("dumVE") == 0) & (pl.col("yd") == 0)).se
 )
 
 
-#== df for plot and visualisations ==
+# == df for plot and visualisations ==
 
 df_final = df_dum.filter(pl.col("dumVE") == 0)
 df_val = df_dum.filter(pl.col("dumVE") == 1)
 
-#== Early descive statistics ===
+# == Early descive statistics ===
 print(df_final.filter(pl.col("yd") == 1).describe().to_pandas())
 print(df_final.filter(pl.col("yd") == 0).describe().to_pandas())
 
@@ -84,7 +87,7 @@ for column in df_final.columns:
 
         fig.show()
 
-#== Compute Kurtosis and Skewness ===
+# == Compute Kurtosis and Skewness ===
 results = []
 for yd_value in [0, 1]:
     df_subset = df_final.filter(pl.col("yd") == yd_value).drop_nans()
@@ -103,7 +106,7 @@ for yd_value in [0, 1]:
 df_stats = pl.DataFrame(results)
 print(df_stats)
 
-#== Conversion in latex table ===
+# == Conversion in latex table ===
 if convert_to_latex == True:
     # Convert to LaTeX table
     latex_table = df_stats.to_pandas().to_latex(
@@ -126,7 +129,7 @@ if convert_to_latex == True:
 else:
     pass
 
-#== High leverage observations : How much a single point is different with respect to the others ? ===
+# == High leverage observations : How much a single point is different with respect to the others ? ===
 skip = {"yd", "dumVE", "id"}
 
 pdf = df_final.to_pandas()
@@ -164,7 +167,8 @@ print(
     .head(10)
 )
 
-#=== Biserial test yd us categorical => default or not : see the correlation between yd and other numerical variables===
+# === Biserial test yd us categorical => default or not : see the correlation between yd and other numerical variables===
+
 
 def pointbiserial_all(df: pl.DataFrame, y_col: str = "yd", skip=("yd", "id", "dumVE")):
     results_corr = []
@@ -205,10 +209,10 @@ print(df_results_corr)
 
 if convert_to_latex == True:
     latex_table = df_results_corr.to_pandas().to_latex(
-    index=False,
-    float_format="%.3f",
-    caption="Test of Point-Biserial Correlation",
-    label="tab:test_corr",
+        index=False,
+        float_format="%.3f",
+        caption="Test of Point-Biserial Correlation",
+        label="tab:test_corr",
     )
 
     # Save to a .tex file
@@ -359,7 +363,6 @@ print("\n=== OLS ===\n", model.summary())
 print("\n=== Logit ===\n", model_log.summary())
 print("\n=== Probit ===\n", model_prob.summary())
 
-
 # 12 === Concordance pairs == hand made
 p_hat = df_score["score_probit"]
 
@@ -404,11 +407,15 @@ print(f"Perrcentage Concordance : {percent_concordant:.2f}%")
 if percent_concordant == percent_concordant_sk:
     print("same results for hand made and sklearn: ", percent_concordant)
 else:
-    print("different results for hand made and sklearn: ", percent_concordant, percent_concordant_sk)
+    print(
+        "different results for hand made and sklearn: ",
+        percent_concordant,
+        percent_concordant_sk,
+    )
 
 # 13 === ols , probit and logit with prefered variables ===
 y = df_final["yd"].to_pandas()
-X = sm.add_constant(df_final["tdta", "ebita", "invsls"].to_pandas())
+X = sm.add_constant(df_final["tdta", "gempl", "opita", "invsls"].to_pandas())
 
 # result = stats.linregress(df_pd["tdta"], df_pd["yd"])
 # === linear regression ===
@@ -489,7 +496,7 @@ df_results_table = results_table.tables[0]
 df_results_table = pd.DataFrame(df_results_table)
 df_results_table.reset_index(inplace=True)
 df_results_table.rename(columns={"index": ""}, inplace=True)
-#== Convert to LaTeX table ===
+# == Convert to LaTeX table ===
 if convert_to_latex == True:
     latex_table = df_results_table.to_latex(
         index=False,
@@ -557,7 +564,7 @@ print(f"Number of defaulting firms {n_0}: vs non defaulting firms {n_1}")
 
 # === ols , probit and logit with prefered variables ===
 y = df_val["yd"].to_pandas()
-X = sm.add_constant(df_final["tdta", "ebita", "invsls"].to_pandas())
+X = sm.add_constant(df_val["tdta", "gempl", "opita", "invsls"].to_pandas())
 
 # result = stats.linregress(df_pd["tdta"], df_pd["yd"])
 # === linear regression ===
@@ -638,7 +645,7 @@ df_results_table = results_table.tables[0]
 df_results_table = pd.DataFrame(df_results_table)
 df_results_table.reset_index(inplace=True)
 df_results_table.rename(columns={"index": ""}, inplace=True)
-#== Convert to LaTeX table ===
+# == Convert to LaTeX table ===
 if convert_to_latex == True:
     latex_table = df_results_table.to_latex(
         index=False,
@@ -699,7 +706,7 @@ for regression in regressions:
         plt.grid(True)
         plt.show()
 
-# %% 15 == Plots of the distribution of Standardized Person Residuals ==
+# 15 == Plots of the distribution of Standardized Person Residuals ==
 p_ols = np.clip(p_ols, 1e-6, 1 - 1e-6)
 
 # === Compute standardized Pearson residuals ===
@@ -711,7 +718,7 @@ df_resid = pd.DataFrame({"OLS": r_ols, "Logit": r_logit, "Probit": r_probit}).me
     var_name="Model", value_name="Pearson Residual"
 )
 
-#=== plot pearson standazdized residuals ===
+# === plot pearson standazdized residuals ===
 g = sns.FacetGrid(df_resid, col="Model", sharex=True, sharey=True, height=4, aspect=1.2)
 g.map_dataframe(
     sns.kdeplot, x="Pearson Residual", fill=True, color="#1f77b4", alpha=0.4
