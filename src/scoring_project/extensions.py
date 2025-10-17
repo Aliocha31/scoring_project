@@ -158,3 +158,56 @@ print(results_table)
 print("\n=== OLS ===\n", model_ols.summary())
 print("\n=== Logit ===\n", model_log.summary())
 print("\n=== Probit ===\n", model_prob.summary())
+
+# === PART 6: Evaluate on TEST sample ===
+print("\n=== EVALUATION ON TEST SAMPLE ===")
+
+# Prepare X_test and y_test
+X_test = sm.add_constant(X_test_pl[core_features].to_pandas())
+y_test = y_test_pl[target_col].to_pandas().reset_index(drop=True)
+
+# Predict using models fitted on the TRAIN sample
+p_ols_test = model_ols.predict(X_test)
+p_logit_test = model_log.predict(X_test)
+p_probit_test = model_prob.predict(X_test)
+
+
+# Compute AUCs for TEST and TRAIN
+def safe_auc(y_true, scores):
+    try:
+        return roc_auc_score(np.asarray(y_true), np.asarray(scores))
+    except Exception:
+        return np.nan
+
+
+# --- TRAIN AUC ---
+auc_train_ols = safe_auc(y_train, p_ols)
+auc_train_logit = safe_auc(y_train, p_logit)
+auc_train_probit = safe_auc(y_train, p_probit)
+
+# --- TEST AUC ---
+auc_test_ols = safe_auc(y_test, p_ols_test)
+auc_test_logit = safe_auc(y_test, p_logit_test)
+auc_test_probit = safe_auc(y_test, p_probit_test)
+
+# === Display comparison table ===
+auc_comparison = pd.DataFrame(
+    {
+        "Model": ["OLS", "Logit", "Probit"],
+        "AUC (Train)": [auc_train_ols, auc_train_logit, auc_train_probit],
+        "AUC (Test)": [auc_test_ols, auc_test_logit, auc_test_probit],
+    }
+)
+
+print("\n=== AUC Comparison: Train vs Test ===")
+print(auc_comparison.to_string(index=False))
+
+#  save as LaTeX
+latex_auc = auc_comparison.to_latex(
+    index=False,
+    float_format="%.3f",
+    caption="Comparison of AUC between Training and Test Samples",
+    label="tab:auc_train_test",
+)
+with open("results/auc_train_test.tex", "w") as f:
+    f.write(latex_auc)
