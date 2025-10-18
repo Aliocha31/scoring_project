@@ -1,4 +1,3 @@
-import sys
 import warnings
 
 import matplotlib.pyplot as plt
@@ -347,7 +346,7 @@ else:
         f.write(latex_table)
 
     print(latex_table)
-sys.exit()
+
 # === Biserial test yd us categorical => default or not : see the correlation between yd and other numerical variables===
 
 
