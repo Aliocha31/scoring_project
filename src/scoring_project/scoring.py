@@ -1,3 +1,4 @@
+import sys
 import warnings
 
 import matplotlib.pyplot as plt
@@ -15,7 +16,7 @@ from statsmodels.discrete.discrete_model import Logit, Probit
 from statsmodels.iolib.summary2 import summary_col
 
 # convert to latex : True to createnew file, False to skip this step
-convert_to_latex = True
+convert_to_latex = False
 
 if convert_to_latex == False:
     warnings.warn(
@@ -167,6 +168,186 @@ print(
     .head(10)
 )
 
+
+# %%   === test : test of normality ===
+def test_homogeneity_of_variances_variable(
+    df: pl.DataFrame, value_col: str, group_col: str = "yd", alpha: float = 0.05
+):
+    """
+    Test the homogeneity of variances between two groups for a given variable.
+    Uses:
+      - Shapiro–Wilk test for normality within each group.
+      - Bartlett test if both groups are normal.
+      - Levene (median-centered) test otherwise.
+    Returns a dictionary with test results.
+    """
+
+    # Keep only the relevant columns and drop missing values
+    sub = df.select([group_col, value_col]).drop_nulls()
+
+    # Extract values for each group
+    g0 = sub.filter(pl.col(group_col) == 0)[value_col].to_numpy()
+    g1 = sub.filter(pl.col(group_col) == 1)[value_col].to_numpy()
+
+    n0, n1 = len(g0), len(g1)
+
+    # Require at least 3 observations for each group to run Shapiro
+    if n0 < 3 or n1 < 3:
+        return {
+            "Variable": value_col,
+            "test": None,
+            "pvalue": np.nan,
+            "decision_normality": None,
+            "p_shapiro_0": np.nan,
+            "p_shapiro_1": np.nan,
+            "equal_variances": None,
+            "n0": n0,
+            "n1": n1,
+        }
+
+    # Normality tests (Shapiro–Wilk)
+    sh0 = stats.shapiro(g0)
+    sh1 = stats.shapiro(g1)
+    decision_normality = (sh0.pvalue > alpha) and (sh1.pvalue > alpha)
+
+    # Handle edge cases: one group has zero variance
+    var0 = np.var(g0, ddof=1) if n0 > 1 else 0.0
+    var1 = np.var(g1, ddof=1) if n1 > 1 else 0.0
+    if var0 == 0 or var1 == 0:
+        return {
+            "Variable": value_col,
+            "test": "undefined (zero variance)",
+            "pvalue": np.nan,
+            "decision_normality": decision_normality,
+            "p_shapiro_0": float(sh0.pvalue),
+            "p_shapiro_1": float(sh1.pvalue),
+            "equal_variances": (var0 == var1),
+            "n0": n0,
+            "n1": n1,
+        }
+
+    # Choose the appropriate test for equality of variances
+    if decision_normality:
+        stat, p = stats.bartlett(g0, g1)
+        test_name = "bartlett"
+    else:
+        stat, p = stats.levene(g0, g1, center="median")
+        test_name = "levene"
+
+    # Return a clean summary of results
+    return {
+        "Variable": value_col,
+        "test": test_name,
+        "pvalue": round(float(p), 3),
+        "decision_normality": decision_normality,  # True if both groups are normal
+        "p_shapiro_0": round(float(sh0.pvalue), 3),
+        "p_shapiro_1": round(float(sh1.pvalue), 3),
+        "equal_variances": (p >= alpha),  # True if equal variances not rejected
+        "n0": n0,
+        "n1": n1,
+    }
+
+
+def test_all_variables(
+    df: pl.DataFrame,
+    group_col: str = "yd",
+    alpha: float = 0.05,
+    skip: list = ("yd", "id", "dumVE"),
+) -> pd.DataFrame:
+    """
+    Apply the variance homogeneity test to all numeric columns in the dataset.
+    Skips identifier and dummy columns by default.
+    Returns a pandas DataFrame with results for all variables.
+    """
+    results = []
+    for col in df.columns:
+        if col in skip:
+            continue
+        if df[col].dtype in (pl.Float64, pl.Float32, pl.Int64, pl.Int32):
+            res = test_homogeneity_of_variances_variable(
+                df, value_col=col, group_col=group_col, alpha=alpha
+            )
+            results.append(res)
+    out = pd.DataFrame(results)
+    # Optional: sort so that rejected equality-of-variance cases appear first
+    out = out.sort_values(by=["equal_variances", "pvalue"], ascending=[True, True])
+    return out
+
+
+df_results = test_all_variables(df_final, group_col="yd", alpha=0.05)
+print(df_results)
+
+print("Variables rejecting the null hypothesis of equal variances (p < 0.05):")
+print(
+    df_results[df_results["pvalue"] < 0.05][
+        ["Variable", "test", "pvalue", "equal_variances"]
+    ]
+)
+
+if convert_to_latex == False:
+    pass
+else:
+    # Export results to LaTeX table
+    latex_table = df_results.to_latex(
+        index=False,
+        escape=False,  # allows math symbols if present
+        caption="Test of Normality and Equality of Variances",
+        label="tab:test_normality",
+        float_format="%.3f",  # round to 3 decimals
+        column_format="lrrrrrrr",  # left + right alignments
+        longtable=False,
+    )
+
+    # Print or save to a file
+    print(latex_table)
+
+    # Optionally save to a .tex file
+    with open("results/table_normality_variances.tex", "w") as f:
+        f.write(latex_table)
+
+# === test for equality of means ===
+results_means = []
+for column in df_final.drop_nans().columns:
+    if column not in ["yd", "dumVE", "id"]:
+        rvs0 = df_final.filter(pl.col("yd") == 0)[column]
+        rvs1 = df_final.filter(pl.col("yd") == 1)[column]
+
+        if column in ["tdta", "reta", "nwcta"]:  # they have equal variances
+            t_stat, p_val = stats.ttest_ind(rvs0, rvs1, equal_var=False)
+        else:
+            t_stat, p_val = stats.ttest_ind(rvs0, rvs1, equal_var=True)
+
+        results_means.append(
+            {"Variable": column, "t_statistic": t_stat, "p_value": p_val}
+        )
+        print(f"T-statistic: {t_stat:.3f}, p-value: {p_val:.3f} fir {column}")
+df_results_means = pl.DataFrame(results_means)
+print(df_results_means.sort(by="p_value"))
+print("If p_val < 0.05 we reject the null hypothesis means are significantly different")
+print(df_results_means.filter(pl.col("p_value") < 0.05))
+
+if convert_to_latex == False:
+    pass
+else:
+    # conversion in latex table ===
+    latex_table = df_results_means.to_pandas().to_latex(
+        index=False,
+        float_format="%.3f",
+        caption="Test of Equality of Means",
+        label="tab:test_means",
+        column_format="lrr",
+        escape=False,
+    )
+
+    latex_table = latex_table.replace(
+        r"\begin{tabular}{lrr}", r"\begin{tabular}{lrr}\n\hline"
+    ).replace(r"\end{tabular}", r"\hline\n\end{tabular}")
+
+    with open("results/test_means.tex", "w") as f:
+        f.write(latex_table)
+
+    print(latex_table)
+sys.exit()
 # === Biserial test yd us categorical => default or not : see the correlation between yd and other numerical variables===
 
 
@@ -290,6 +471,34 @@ sns.pairplot(
 )
 plt.suptitle("Pairplot with Regression Lines and Density on Diagonal", y=1.02)
 plt.show()
+
+
+# === Lower-triangle heatmap of absolute bivariate correlations ===
+
+corr = (
+    df_final.select([c for c in df_final.columns if c not in ("yd", "id")])
+    .to_pandas()
+    .corr()
+    .abs()
+)
+
+# mask to display only lower triangle
+mask = np.triu(np.ones_like(corr, dtype=bool))
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(
+    corr,
+    mask=mask,
+    cmap="Reds",
+    annot=True,
+    fmt=".2f",
+    cbar_kws={"label": "Absolute Pearson correlation |r|"},
+    square=True,
+)
+plt.title("Lower-Triangle Heatmap of Absolute Bivariate Correlations", fontsize=12)
+plt.tight_layout()
+plt.show()
+
 
 # === Regression Models ===
 
