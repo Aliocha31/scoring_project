@@ -475,7 +475,7 @@ plt.show()
 # === Lower-triangle heatmap of absolute bivariate correlations ===
 
 corr = (
-    df_final.select([c for c in df_final.columns if c not in ("yd", "id")])
+    df_final.select([c for c in df_final.columns if c not in ("yd", "id", "dumVE")])
     .to_pandas()
     .corr()
     .abs()
