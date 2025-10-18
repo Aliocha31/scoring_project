@@ -1,51 +1,30 @@
 # -----------------------------------------------------------
-# Binary scoring (yd: 0 = non-default, 1 = default) with model comparison
-#
-# Script goals:
-#  - Build a robust credit scoring model to predict default probability.
-#  - Compare multiple classifiers under a consistent preprocessing pipeline.
-#  - Select the best model via ROC AUC on a hold-out validation set.
-#  - Provide a leaderboard with rich metrics useful for imbalanced datasets.
-#
-# Methodological choices:
-#  - Preprocessing = imputation + standardization (numerical) + one-hot (categorical),
-#    encapsulated in a Pipeline → prevents data leakage.
-#  - GridSearchCV with StratifiedKFold(5), scoring="roc_auc":
-#    ROC AUC is threshold-independent and robust to imbalance.
-#  - Validation on a hold-out set (dumVE=1) distinct from Estimation (dumVE=0).
-#  - Metrics:
-#    * ROC AUC: global ranking quality.
-#    * PR AUC: emphasizes the minority (default) class.
-#    * F1 & Accuracy: decision-level metrics at fixed/optimized thresholds.
-#    * Confusion matrix: operational view of errors.
-#  - Thresholds: report both fixed 0.5 and optimized-for-F1,
-#    since the optimal threshold is business-context dependent.
+# Credit scoring — deterministic (even/odd) vs random split
+# - KNN imputation that ONLY fills missing entries (observed data untouched)
+# - Models: Logit, Probit (statsmodels), OLS (probabilistic baseline), Ridge,
+#           Random Forest, HistGradientBoosting
+# - Pipelines with scaler+onehot (no imputation inside pipeline)
+# - Cross-validated AUC computed robustly (manual CV, model-agnostic)
+# - Leaderboards per split + summary comparison
 # -----------------------------------------------------------
 
-import os
 import warnings
 from typing import Dict, List, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 import polars as pl
+import statsmodels.api as sm
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
-    GradientBoostingClassifier,
     HistGradientBoostingClassifier,
     RandomForestClassifier,
 )
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    confusion_matrix,
-    f1_score,
-    roc_auc_score,
-)
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.impute import KNNImputer
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -54,13 +33,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # =========================
 # ======== CONFIG =========
 # =========================
-CSV_PATH = "./defaut2000.csv"  
-TARGET = "yd"  # Binary target: 0 = non-default, 1 = default
+CSV_PATH = "./defaut2000.csv"
+TARGET = "yd"
 RANDOM_STATE = 42
 
-# Feature list:
-# - Leave [] → use all columns except ["yd","dumVE","id"].
-# - Otherwise, define explicitly (example: ["ebita","opita","reta"]).
 FEATURES: List[str] = [
     "ebita",
     "opita",
@@ -69,79 +45,103 @@ FEATURES: List[str] = [
 ]
 
 
-# -----------------------
+# -----------------------------------------------------------
+# 0) Wrappers for statsmodels Probit & OLS (sklearn API)
+# -----------------------------------------------------------
+class ProbitClassifier(BaseEstimator, ClassifierMixin):
+    """Statsmodels Probit wrapped for sklearn API."""
+
+    def __init__(self, max_iter: int = 200):
+        self.max_iter = max_iter
+        self.model_ = None
+
+    def fit(self, X, y):
+        y = np.asarray(y).astype(int)
+        X = np.asarray(X)
+        Xc = sm.add_constant(X, has_constant="add")
+        self.model_ = sm.Probit(y, Xc).fit(disp=0, maxiter=self.max_iter)
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X)
+        Xc = sm.add_constant(X, has_constant="add")
+        p = np.asarray(self.model_.predict(Xc)).reshape(-1)
+        p = np.clip(p, 1e-9, 1 - 1e-9)
+        return np.column_stack([1 - p, p])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+class OLSClassifier(BaseEstimator, ClassifierMixin):
+    """
+    OLS on binary y; clip predictions to [0,1] and treat as probabilities.
+    Useful as a simple linear baseline.
+    """
+
+    def __init__(self):
+        self.model_ = None
+
+    def fit(self, X, y):
+        y = np.asarray(y).astype(int)
+        X = np.asarray(X)
+        Xc = sm.add_constant(X, has_constant="add")
+        self.model_ = sm.OLS(y, Xc).fit()
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X)
+        Xc = sm.add_constant(X, has_constant="add")
+        p = np.asarray(self.model_.predict(Xc)).reshape(-1)
+        p = np.clip(p, 1e-9, 1 - 1e-9)
+        return np.column_stack([1 - p, p])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+# -----------------------------------------------------------
 # 1) Load & split
-# -----------------------
+# -----------------------------------------------------------
 def load_data(csv_path: str = CSV_PATH) -> pl.DataFrame:
-    """
-    Load the CSV using Polars and create dumVE.
-    Steps & rationale:
-      - separator=";" : matches your dataset format.
-      - null_values=["-99.99"] : standardizes this code into NaN.
-      - fill_null(np.nan): ensures compatibility with scikit-learn later.
-      - sort(['yd','reta']) if present: kept from your snippet (ensures stable ordering).
-      - drop_nans(): removes entirely empty rows.
-      - dumVE from even/odd row index:
-          even   → dumVE=0 (Estimation set)
-          odd    → dumVE=1 (Validation set)
-        → simple deterministic train/validation split.
-    """
     df = pl.read_csv(
         csv_path, use_pyarrow=True, separator=";", null_values=["-99.99"]
     ).fill_null(np.nan)
-
+    # Keep your historical ordering
     sort_cols = [c for c in ["yd", "reta"] if c in df.columns]
     if sort_cols:
         df = df.sort(sort_cols)
-        
+    # Even/odd split flag
     df = df.with_row_index("id").with_columns(
         ((pl.col("id") % 2 == 0).cast(pl.Int8)).alias("dumVE")
     )
     return df
 
 
-# -----------------------
-# 2) Feature selection 
-# -----------------------
+# -----------------------------------------------------------
+# 2) Feature selection
+# -----------------------------------------------------------
 def select_features_polars(df_pl: pl.DataFrame, requested: List[str]) -> List[str]:
-    """
-    Determine the final list of explanatory variables from the Polars schema.
-
-    Rules:
-      - If 'requested' is empty → use all columns except {TARGET, 'dumVE', 'id'}.
-      - If 'requested' is non-empty → strict intersection with DataFrame columns.
-
-    Returns: list of feature names to use.
-    """
     cols = df_pl.columns
     base_exclude = {TARGET, "dumVE", "id"}
-
     if not requested:
         feats = [c for c in cols if c not in base_exclude]
     else:
         feats = [c for c in requested if c in cols]
-
     if len(feats) == 0:
         raise ValueError(
-            f"No valid features found. Requested: {requested} | "
-            f"Available columns: {cols}"
+            f"No valid features found. Requested: {requested} | Available: {cols}"
         )
     return feats
 
 
-# -----------------------
+# -----------------------------------------------------------
 # 3) Convert to pandas & check target
-# -----------------------
+# -----------------------------------------------------------
 def to_pandas_and_check_target(df_pl: pl.DataFrame) -> pd.DataFrame:
-    """
-    Convert Polars → pandas and validate the binary target.
-    - Ensures TARGET exists.
-    - Ensures values are in {0,1}.
-    - Casts to int (avoid float 0.0/1.0).
-    """
     df_pd = df_pl.to_pandas()
     if TARGET not in df_pd.columns:
-        raise ValueError(f"Target column '{TARGET}' not found.")
+        raise ValueError(f"Target '{TARGET}' not found.")
     uniq = set(pd.unique(df_pd[TARGET].dropna()))
     if not uniq.issubset({0, 1, 0.0, 1.0}):
         raise ValueError(f"Target '{TARGET}' must be binary {{0,1}}. Found: {uniq}")
@@ -149,92 +149,126 @@ def to_pandas_and_check_target(df_pl: pl.DataFrame) -> pd.DataFrame:
     return df_pd
 
 
-# -----------------------
-# 4) Build train/validation sets
-# -----------------------
+# -----------------------------------------------------------
+# 4) KNN imputation that ONLY fills missing entries
+# -----------------------------------------------------------
+def knn_impute_only_missing(
+    df_pd: pd.DataFrame,
+    features: List[str],
+    n_neighbors: int = 3,
+    scale: bool = True,
+) -> pd.DataFrame:
+    """
+    Impute only missing entries in 'features' using KNN.
+    Observed (non-missing) values are left EXACTLY as they were.
+    """
+    df_out = df_pd.copy()
+    X = df_pd[features].copy()
+
+    mask_missing = X.isna()
+
+    # Scale for distance computation (recommended)
+    if scale:
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(
+            scaler.fit_transform(X), index=X.index, columns=X.columns
+        )
+    else:
+        X_scaled = X
+
+    imputer = KNNImputer(n_neighbors=n_neighbors)
+    X_imputed_scaled = imputer.fit_transform(X_scaled)
+
+    if scale:
+        X_imputed = pd.DataFrame(
+            scaler.inverse_transform(X_imputed_scaled), index=X.index, columns=X.columns
+        )
+    else:
+        X_imputed = pd.DataFrame(X_imputed_scaled, index=X.index, columns=X.columns)
+
+    # Write back ONLY where values were missing
+    X_filled = X.copy()
+    X_filled[mask_missing] = X_imputed[mask_missing]
+
+    # Replace in original df
+    df_out[features] = X_filled
+
+    # Optional safety check:
+    # assert np.allclose(X_filled[~mask_missing], X[~mask_missing], equal_nan=True)
+
+    return df_out
+
+
+# -----------------------------------------------------------
+# 5) Build splits
+# -----------------------------------------------------------
 def build_train_valid(df_pd: pd.DataFrame, features: List[str]):
-    """
-    Construct Estimation and Validation sets:
-      - Estimation = dumVE==0 ; Validation = dumVE==1
-      - Drop rows with missing target
-      - Restrict X to the chosen features
-    Rationale: hold-out Validation (dumVE=1) is never used in CV → honest generalization check.
-    """
+    """Deterministic even/odd split via dumVE."""
     train = df_pd[df_pd["dumVE"] == 0].copy()
     valid = df_pd[df_pd["dumVE"] == 1].copy()
-
-    train = train.dropna(subset=[TARGET])
-    valid = valid.dropna(subset=[TARGET])
-
-    X_train, y_train = train[features], train[TARGET].astype(int)
-    X_valid, y_valid = valid[features], valid[TARGET].astype(int)
+    X_train, y_train = train[features], train[TARGET]
+    X_valid, y_valid = valid[features], valid[TARGET]
     return features, X_train, y_train, X_valid, y_valid
 
 
-# -----------------------
-# 5) Preprocessing (scikit-learn)
-# -----------------------
+def build_random_split(
+    df_pd: pd.DataFrame, features: List[str], test_size: float = 0.25
+):
+    """Stratified random split for a fair comparison."""
+    X = df_pd[features]
+    y = df_pd[TARGET]
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        X, y, test_size=test_size, stratify=y, random_state=RANDOM_STATE
+    )
+    return features, X_train, y_train, X_valid, y_valid
+
+
+# -----------------------------------------------------------
+# 6) Preprocessing and models
+# -----------------------------------------------------------
 def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
-    """
-    Standard preprocessing:
-      - Numeric (+ boolean) → median imputation + StandardScaler
-        * Median imputation: robust to outliers.
-        * StandardScaler: important for linear models (LogReg) and gradient boosting.
-      - Categorical → mode imputation + OneHotEncoder(handle_unknown='ignore')
-        * 'ignore' makes it robust to unseen categories in production.
-    Encapsulated in ColumnTransformer for clean pipelines and no leakage.
-    """
+    # Imputation has already been done globally → only scale + onehot
     num_cols = X.select_dtypes(include=["number", "bool"]).columns.tolist()
     cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
 
-    num_pipe = Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
-    )
-    cat_pipe = Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]
-    )
+    num_pipe = Pipeline([("scaler", StandardScaler())])
+
+    # Dense output for universal compatibility (HGB, statsmodels, etc.)
+    try:
+        cat_pipe = Pipeline(
+            [("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]
+        )
+    except TypeError:
+        cat_pipe = Pipeline(
+            [("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False))]
+        )
 
     preproc = ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, num_cols),
-            ("cat", cat_pipe, cat_cols),
-        ],
+        transformers=[("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)],
         remainder="drop",
         verbose_feature_names_out=False,
     )
     return preproc
 
 
-# -----------------------
-# 6) Models & grids (GridSearchCV)
-# -----------------------
 def get_models_and_grids() -> Dict[str, Tuple[object, Dict[str, List]]]:
     """
-    Models considered:
-      - LogisticRegression(class_weight='balanced'): linear baseline, interpretable, handles imbalance.
-      - RandomForestClassifier(class_weight='balanced'): non-linear, robust, good for tabular data.
-      - GradientBoostingClassifier: classic boosting, strong for subtle patterns.
-      - HistGradientBoostingClassifier: efficient boosting with histogram splits.
-
-    Grids: small but meaningful hyperparameter grids
-    → avoids exploding compute time, but explores key knobs (depth, n_estimators, learning_rate).
+    All models expose a usable score for AUC:
+      - logreg, probit, ols -> predict_proba (or proba-like)
+      - ridge, rf, hgb -> decision_function or predict_proba (handled in _scores_for_auc_flexible)
     """
     return {
         "logreg": (
             LogisticRegression(
                 max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE
             ),
-            {
-                "model__C": [0.1, 1.0, 3.0],
-                "model__penalty": ["l2"],
-                "model__solver": ["lbfgs", "saga"],
-            },
+            {"model__C": [0.1, 1.0, 3.0], "model__solver": ["lbfgs", "saga"]},
+        ),
+        "probit": (ProbitClassifier(max_iter=200), {}),
+        "ols": (OLSClassifier(), {}),
+        "ridge": (
+            RidgeClassifier(class_weight="balanced", random_state=RANDOM_STATE),
+            {"model__alpha": [0.5, 1.0, 3.0, 10.0]},
         ),
         "rf": (
             RandomForestClassifier(
@@ -242,199 +276,178 @@ def get_models_and_grids() -> Dict[str, Tuple[object, Dict[str, List]]]:
             ),
             {
                 "model__n_estimators": [300, 600],
-                "model__max_depth": [None, 12],
-                "model__min_samples_leaf": [1, 2],
-            },
-        ),
-        "gboost": (
-            GradientBoostingClassifier(random_state=RANDOM_STATE),
-            {
-                "model__n_estimators": [200, 400],
-                "model__learning_rate": [0.05, 0.1],
-                "model__max_depth": [2, 3],
+                "model__max_depth": [5, 8, 10],
+                "model__min_samples_leaf": [2, 4],
             },
         ),
         "hgb": (
             HistGradientBoostingClassifier(random_state=RANDOM_STATE),
             {
                 "model__learning_rate": [0.05, 0.1],
-                "model__max_depth": [None, 8],
-                "model__l2_regularization": [0.0, 0.1],
+                "model__max_depth": [3, 5, 8],
+                "model__l2_regularization": [0.1, 0.3],
             },
         ),
     }
 
 
-# -----------------------
-# 7) Metrics & thresholds
-# -----------------------
-def evaluate_probs(y_true: np.ndarray, p1: np.ndarray, threshold: float = 0.5) -> dict:
-    """
-    Compute metrics from predicted probabilities (class 1 = default).
-    Why these metrics?
-      - ROC AUC: global ranking quality, threshold-free.
-      - PR AUC: emphasizes performance on minority class.
-      - F1 & Accuracy @ threshold: decision metrics for a given cutoff.
-      - Confusion matrix: operational view of FP/FN trade-offs.
-    """
-    y_pred = (p1 >= threshold).astype(int)
-    return {
-        "roc_auc": float(roc_auc_score(y_true, p1)),
-        "pr_auc": float(average_precision_score(y_true, p1)),
-        "f1": float(f1_score(y_true, y_pred)),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "threshold": float(threshold),
-        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist(),
-    }
+# -----------------------------------------------------------
+# 7) Evaluation utilities (robust CV AUC)
+# -----------------------------------------------------------
+def _scores_for_auc_flexible(estimator, X):
+    """Return a continuous score for AUC, whatever the estimator exposes."""
+    if hasattr(estimator, "predict_proba"):
+        p = estimator.predict_proba(X)
+        if isinstance(p, np.ndarray) and p.ndim == 2 and p.shape[1] >= 2:
+            return p[:, 1]
+        elif isinstance(p, np.ndarray) and p.ndim == 1:
+            return p
+    if hasattr(estimator, "decision_function"):
+        return estimator.decision_function(X)
+    # Fallback (less ideal) : raw predictions
+    pred = estimator.predict(X)
+    return np.asarray(pred).reshape(-1)
 
 
-def find_best_threshold(y_true: np.ndarray, p1: np.ndarray) -> float:
+def cross_val_auc_safe(pipeline, X, y, cv, random_state=42):
     """
-    Find the probability threshold that maximizes F1 on the Validation set.
-    Why F1? Balanced measure when FP/FN costs are not specified.
+    Robust CV AUC for all models:
+    - manual KFolds
+    - fit on train fold
+    - get continuous score on validation fold (proba/decision/predict)
+    - average AUC across folds
     """
-    thresholds = np.linspace(0.05, 0.95, 19)
-    best_t, best_f1 = 0.5, -1.0
-    for t in thresholds:
-        f1 = f1_score(y_true, (p1 >= t).astype(int))
-        if f1 > best_f1:
-            best_f1, best_t = f1, t
-    return float(best_t)
+    aucs = []
+    # standardize indices
+    X = X.reset_index(drop=True)
+    y = y.reset_index(drop=True)
+
+    # Ensure a StratifiedKFold object
+    if isinstance(cv, StratifiedKFold):
+        skf = cv
+    else:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+
+    for tr_idx, va_idx in skf.split(X, y):
+        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+
+        est = clone(pipeline)
+        est.fit(X_tr, y_tr)
+
+        s_va = _scores_for_auc_flexible(est, X_va)
+        try:
+            auc = roc_auc_score(y_va, s_va)
+            aucs.append(auc)
+        except Exception:
+            # skip if scoring failed on this fold
+            continue
+
+    if len(aucs) == 0:
+        return np.nan
+    return float(np.mean(aucs))
 
 
-# -----------------------
-# 8) Training, comparison & saving
-# -----------------------
-def compare_models(
-    X_train, y_train, X_valid, y_valid, save_best_to: str = "best_classifier.joblib"
-):
-    """
-    Full evaluation pipeline:
-      1) Build preprocessing on X_train (avoid leakage).
-      2) For each model:
-         - GridSearchCV (5-fold StratifiedKFold, scoring='roc_auc') → 'cv_roc_auc'.
-         - Predict probabilities on Validation.
-         - Compute metrics at threshold 0.5 and at best-F1 threshold.
-         - Save a row into 'leaderboard'.
-      3) Sort leaderboard by Validation ROC AUC (main criterion).
-      4) Save best pipeline (preprocessing + model) for reuse/deployment.
-    """
+def evaluate_auc(estimator, X_train, y_train, X_test, y_test):
+    s_tr = _scores_for_auc_flexible(estimator, X_train)
+    s_te = _scores_for_auc_flexible(estimator, X_test)
+    auc_train = roc_auc_score(y_train, s_tr)
+    auc_test = roc_auc_score(y_test, s_te)
+    return auc_train, auc_test
+
+
+def compare_models(X_train, y_train, X_valid, y_valid):
     preproc = build_preprocessor(X_train)
     models = get_models_and_grids()
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
     leaderboard = []
-    best_val_auc = -np.inf
-    best_name, best_pipe = None, None
 
     for name, (estimator, grid) in models.items():
-        pipe = Pipeline(
-            [
-                ("preprocessor", preproc),
-                ("model", estimator),
-            ]
+        pipe = Pipeline([("preprocessor", preproc), ("model", estimator)])
+
+        # 1) GridSearch pour hyperparamètres s'il y en a, sinon fit direct
+        has_grid = (grid is not None) and (len(grid) > 0)
+        if has_grid:
+            gs = GridSearchCV(
+                pipe, param_grid=grid, cv=cv, scoring=None, n_jobs=-1, verbose=0
+            )
+            gs.fit(X_train, y_train)
+            best_est = gs.best_estimator_
+            best_params = gs.best_params_
+        else:
+            best_est = pipe.fit(X_train, y_train)
+            best_params = {}
+
+        # 2) CV AUC robuste (manuel) pour TOUS les modèles
+        cv_auc = cross_val_auc_safe(best_est, X_train, y_train, cv, RANDOM_STATE)
+
+        # 3) AUC train/test
+        auc_train, auc_valid = evaluate_auc(
+            best_est, X_train, y_train, X_valid, y_valid
         )
 
-        gs = GridSearchCV(
-            pipe,
-            param_grid=grid,
-            cv=cv,
-            scoring="roc_auc",
-            n_jobs=-1,
-            verbose=0,
-        )
-        gs.fit(X_train, y_train)
-
-        # Get predicted probabilities for Validation
-        p1_valid = (
-            gs.best_estimator_.predict_proba(X_valid)[:, 1]
-            if hasattr(gs.best_estimator_["model"], "predict_proba")
-            else gs.best_estimator_.decision_function(X_valid)
-        )
-
-        metrics_05 = evaluate_probs(y_valid, p1_valid, threshold=0.5)
-        t_best = find_best_threshold(y_valid, p1_valid)
-        metrics_t = evaluate_probs(y_valid, p1_valid, threshold=t_best)
-
-        # === Leaderboard row ===
         leaderboard.append(
             {
-                "model": name,  # Model short name
-                "cv_roc_auc": float(
-                    gs.best_score_
-                ),  # Cross-validated ROC AUC on Estimation (selection score)
-                "val_roc_auc": metrics_05[
-                    "roc_auc"
-                ],  # ROC AUC on Validation (hold-out, threshold-free)
-                "val_pr_auc": metrics_05[
-                    "pr_auc"
-                ],  # Precision-Recall AUC on Validation
-                "val_f1@0.5": metrics_05["f1"],  # F1 score at fixed threshold 0.5
-                "val_acc@0.5": metrics_05["accuracy"],  # Accuracy at threshold 0.5
-                "best_threshold_val": t_best,  # Threshold maximizing F1 on Validation
-                "val_f1@best_t": metrics_t["f1"],  # F1 at that optimized threshold
-                "best_params": gs.best_params_,  # Hyperparameters chosen by GridSearchCV
-                "cm@best_t": metrics_t[
-                    "confusion_matrix"
-                ],  # Confusion matrix @ best_t: [[TN,FP],[FN,TP]]
+                "model": name,
+                "cv_auc": cv_auc,
+                "train_auc": float(auc_train),
+                "test_auc": float(auc_valid),
+                "best_params": best_params,
             }
         )
 
-        if metrics_05["roc_auc"] > best_val_auc:
-            best_val_auc = metrics_05["roc_auc"]
-            best_name = name
-            best_pipe = gs.best_estimator_
-
-    lb_df = (
+    return (
         pd.DataFrame(leaderboard)
-        .sort_values("val_roc_auc", ascending=False)
+        .sort_values("test_auc", ascending=False)
         .reset_index(drop=True)
     )
 
-    if best_pipe is not None:
-        os.makedirs("models", exist_ok=True)
-        joblib.dump(best_pipe, os.path.join("models", save_best_to))
 
-    return lb_df, best_name, best_val_auc
-
-
-# -----------------------
-# 9) Main
-# -----------------------
+# -----------------------------------------------------------
+# 8) Main pipeline
+# -----------------------------------------------------------
 if __name__ == "__main__":
-    # (a) Load data with Polars
+    # Load
     pl_df = load_data(CSV_PATH)
-
-    # (b) Select features (auto if FEATURES=[])
     features = select_features_polars(pl_df, FEATURES)
-    print(f"\nUsing features ({len(features)}): {features}")
-
-    # (c) Convert to pandas & check target
     df_pd = to_pandas_and_check_target(pl_df)
 
-    # (d) Build Estimation/Validation sets
-    features, X_tr, y_tr, X_va, y_va = build_train_valid(df_pd, features)
+    # KNN impute ONLY missing entries on selected features
+    df_pd = knn_impute_only_missing(df_pd, features, n_neighbors=3, scale=True)
 
-    # (e) Compare models + save best pipeline
-    leaderboard, best_name, best_auc = compare_models(X_tr, y_tr, X_va, y_va)
+    print(f"\nUsing features: {features}")
 
-    # (f) Print leaderboard
-    pd.set_option("display.max_colwidth", 200)
-    print("\n=== Leaderboard (sorted by Validation ROC AUC) ===")
-    cols_show = [
-        "model",
-        "cv_roc_auc",
-        "val_roc_auc",
-        "val_pr_auc",
-        "val_f1@0.5",
-        "val_acc@0.5",
-        "best_threshold_val",
-        "val_f1@best_t",
-        "best_params",
-        "cm@best_t",
-    ]
-    print(leaderboard[cols_show])
-    print(f"\nBest model (Validation AUC): {best_name} (AUC={best_auc:.4f})")
-    print("Best pipeline saved in ./models/best_classifier.joblib")
+    # --- Deterministic Split (even/odd) ---
+    print("\n=== Deterministic Split (dumVE) ===")
+    _, X_tr_det, y_tr_det, X_va_det, y_va_det = build_train_valid(df_pd, features)
+    leaderboard_det = compare_models(X_tr_det, y_tr_det, X_va_det, y_va_det)
+    print(leaderboard_det)
 
-# %%
+    # --- Random Split (stratified) ---
+    print("\n=== Random Split ===")
+    _, X_tr_rand, y_tr_rand, X_va_rand, y_va_rand = build_random_split(df_pd, features)
+    leaderboard_rand = compare_models(X_tr_rand, y_tr_rand, X_va_rand, y_va_rand)
+    print(leaderboard_rand)
+
+    # --- Summary comparison (best rows) ---
+    summary = pd.DataFrame(
+        {
+            "Split": ["Deterministic", "Random"],
+            "Best Model": [
+                leaderboard_det.iloc[0]["model"],
+                leaderboard_rand.iloc[0]["model"],
+            ],
+            "Train AUC": [
+                leaderboard_det.iloc[0]["train_auc"],
+                leaderboard_rand.iloc[0]["train_auc"],
+            ],
+            "Test AUC": [
+                leaderboard_det.iloc[0]["test_auc"],
+                leaderboard_rand.iloc[0]["test_auc"],
+            ],
+        }
+    ).set_index("Split")
+
+    print("\n=== AUC Comparison: Deterministic vs Random Split ===")
+    print(summary)
