@@ -1,20 +1,12 @@
-# -----------------------------------------------------------
-# Credit scoring — deterministic (even/odd) vs random split
-# - KNN imputation that ONLY fills missing entries (observed data untouched)
-# - Models: Logit, Probit (statsmodels), OLS (probabilistic baseline), Ridge,
-#           Random Forest, HistGradientBoosting
-# - Pipelines with scaler+onehot (no imputation inside pipeline)
-# - Cross-validated AUC computed robustly (manual CV, model-agnostic)
-# - Leaderboards per split + summary comparison
-# -----------------------------------------------------------
-
 import warnings
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
 import statsmodels.api as sm
+from scipy import stats
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
@@ -23,7 +15,7 @@ from sklearn.ensemble import (
 )
 from sklearn.impute import KNNImputer
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import auc, roc_auc_score, roc_curve
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -403,6 +395,66 @@ def compare_models(X_train, y_train, X_valid, y_valid):
         .reset_index(drop=True)
     )
 
+    # -----------------------------------------------------------
+    # ROC curves for all models on a given split
+    # -----------------------------------------------------------
+
+
+def fit_models_and_rocs(X_train, y_train, X_valid, y_valid, random_state=RANDOM_STATE):
+    """
+    Re-fit each model (avec meilleure config si grille) sur X_train/y_train,
+    calcule les courbes ROC sur X_valid/y_valid et renvoie les données.
+    """
+    preproc = build_preprocessor(X_train)
+    models = get_models_and_grids()
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    curves = []  # list of dicts: {name, fpr, tpr, auc, estimator}
+    for name, (estimator, grid) in models.items():
+        pipe = Pipeline([("preprocessor", preproc), ("model", estimator)])
+        # GridSearch si grille, sinon fit direct
+        has_grid = (grid is not None) and (len(grid) > 0)
+        if has_grid:
+            gs = GridSearchCV(
+                pipe, param_grid=grid, cv=cv, scoring=None, n_jobs=-1, verbose=0
+            )
+            gs.fit(X_train, y_train)
+            best = gs.best_estimator_
+        else:
+            best = pipe.fit(X_train, y_train)
+        # Score "continu" flexible pour ROC/AUC
+        s_valid = _scores_for_auc_flexible(best, X_valid)
+        fpr, tpr, _ = roc_curve(y_valid, s_valid)
+        auc_val = auc(fpr, tpr)
+        curves.append(
+            {
+                "name": name,
+                "fpr": fpr,
+                "tpr": tpr,
+                "auc": float(auc_val),
+                "estimator": best,
+            }
+        )
+    # trier par AUC décroissante pour une légende lisible
+    curves.sort(key=lambda d: d["auc"], reverse=True)
+
+    return curves
+
+
+def plot_rocs(curves, title="ROC curves"):
+    """Affiche la courbe ROC de chaque modèle + la diagonale aléatoire."""
+    plt.figure(figsize=(8, 6))
+    for c in curves:
+        plt.plot(c["fpr"], c["tpr"], label=f"{c['name']} (AUC = {c['auc']:.3f})")
+    # Classif aléatoire
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Random")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(title)
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
 
 # -----------------------------------------------------------
 # 8) Main pipeline
@@ -430,6 +482,33 @@ if __name__ == "__main__":
     leaderboard_rand = compare_models(X_tr_rand, y_tr_rand, X_va_rand, y_va_rand)
     print(leaderboard_rand)
 
+    print(X_tr_rand.describe())
+    print(X_va_rand.describe())
+
+    # --- Equality of means and variance ---
+    variables = ["ebita", "opita", "reta", "gempl"]
+    results = []
+    results_var = []
+    for var in variables:
+        t_stat, p_val = stats.ttest_ind(
+            X_tr_rand[var],
+            X_va_rand[var],
+            equal_var=False,
+        )
+        results.append({"Variable": var, "t-statistic": t_stat, "p-value": p_val})
+
+    df_ttest = pd.DataFrame(results)
+    print(df_ttest)
+
+    for var in variables:
+        stat, p_val = stats.levene(X_tr_rand[var], X_va_rand[var], center="median")
+        results_var.append(
+            {"Variable": var, "Levene statistic": stat, "p-value": p_val}
+        )
+
+    df_var = pd.DataFrame(results_var)
+    print(df_var)
+
     # --- Summary comparison (best rows) ---
     summary = pd.DataFrame(
         {
@@ -451,3 +530,9 @@ if __name__ == "__main__":
 
     print("\n=== AUC Comparison: Deterministic vs Random Split ===")
     print(summary)
+
+    curves_det = fit_models_and_rocs(X_tr_det, y_tr_det, X_va_det, y_va_det)
+    plot_rocs(curves_det, title="ROC curves — Deterministic split (dumVE)")
+
+    curves_rand = fit_models_and_rocs(X_tr_rand, y_tr_rand, X_va_rand, y_va_rand)
+    plot_rocs(curves_rand, title="ROC curves — Random stratified split")
